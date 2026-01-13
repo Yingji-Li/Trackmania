@@ -22,37 +22,20 @@ def load_config(path: str) -> dict:
 # -----------------------------
 # Observation -> small discrete state
 # -----------------------------
-def log_scale_distance(d: float, max_d: float = 100.0) -> float:
-    d = float(np.clip(d, 0.0, max_d))
-    return float(np.log1p(d) / np.log1p(max_d))
+def extract_features(obs):
+    speed = float(np.array(obs[0]).reshape(-1)[0])  # 0..300-ish
 
-def extract_features(obs) -> np.ndarray:
-    """
-    Normalised continuous feature vector for DQN:
-      [speed, lidar_left, lidar_center, lidar_right] ∈ [0, 1]
-    """
-    speed = float(np.array(obs[0]).reshape(-1)[0])
-    speed = np.clip(speed, 0.0, 300.0) / 300.0
-
-    lidar_hist = np.array(obs[1])        # (4, 19)
-    lidar = lidar_hist.mean(axis=0)      # (19,)
+    lidar_hist = np.array(obs[1])     # (4,19)
+    lidar = lidar_hist.mean(axis=0)
 
     MAX_LIDAR = 100.0
     lidar = np.where(lidar == 0.0, MAX_LIDAR, lidar)
 
-    def sector_min(arr: np.ndarray) -> float:
-        arr = np.where(arr == 0.0, MAX_LIDAR, arr)
-        return float(np.min(arr))
+    left_raw   = float(np.min(lidar[:6]))
+    center_raw = float(np.min(lidar[6:13]))
+    right_raw  = float(np.min(lidar[13:]))
 
-    left_raw   = sector_min(lidar[:6])
-    center_raw = sector_min(lidar[6:13])
-    right_raw  = sector_min(lidar[13:])
-
-    left   = log_scale_distance(left_raw, MAX_LIDAR)
-    center = log_scale_distance(center_raw, MAX_LIDAR)
-    right  = log_scale_distance(right_raw, MAX_LIDAR)
-
-    return np.array([speed, left, center, right], dtype=np.float32)
+    return np.array([speed, left_raw, center_raw, right_raw], dtype=np.float32)
 
 def make_bins():
     speed_bins = np.array([5, 15, 30, 50, 80, 120, 160, 220, 300], dtype=np.float32)
@@ -75,17 +58,22 @@ def discretize_features(feat: np.ndarray, bins) -> tuple:
 # -----------------------------
 def build_action_set():
     steers = [-1.0, -0.5, 0.0, 0.5, 1.0]
-    actions = [np.array([1.0, 0.0, s], dtype=np.float32) for s in steers]
-    actions.append(np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    actions = []
+    actions += [np.array([1.0, 0.0, s], dtype=np.float32) for s in steers]  # gas + steer
+    actions += [np.array([0.0, 0.0, s], dtype=np.float32) for s in steers]  # coast + steer
+    actions += [np.array([0.0, 1.0, s], dtype=np.float32) for s in steers]  # brake + steer
     return actions
 
 
 # -----------------------------
 # Q-learning
 # -----------------------------
-def epsilon_by_episode(ep, eps_start=1.0, eps_end=0.05, eps_decay=500):
-    # Exponential decay
-    return eps_end + (eps_start - eps_end) * math.exp(-ep / eps_decay)
+def epsilon_by_episode(ep, eps_start=1.0, eps_end=0.05, eps_decay=1500):
+    # Keep full exploration early, then decay.
+    if ep < 500:
+        return 1.0
+    ep2 = ep - 500
+    return eps_end + (eps_start - eps_end) * math.exp(-ep2 / eps_decay)
 
 
 def select_action(Q, state, actions, epsilon, rng):
@@ -99,7 +87,7 @@ def select_action(Q, state, actions, epsilon, rng):
 
 def train(
     config_path: str = "config.json",
-    episodes: int = 1000,
+    episodes: int = 4000,
     alpha: float = 0.10,
     gamma: float = 0.99,
     seed: int = 0,
@@ -191,14 +179,13 @@ def train(
     env.unwrapped.wait()  # rtgym pause convenience (optional)
     return ep_returns, moving_avg
 
-
 def plot_progress(ep_returns, moving_avg, out_path: str):
     plt.figure()
     plt.plot(ep_returns, label="Episode return")
     plt.plot(moving_avg, label="Moving average")
     plt.xlabel("Episode")
     plt.ylabel("Return")
-    plt.title("Q-learning progress (tabular, discretized)")
+    plt.title("Tabular Q-learning")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
@@ -210,7 +197,7 @@ if __name__ == "__main__":
     # This is your provided config file :contentReference[oaicite:6]{index=6}
     train(
         config_path = Path("C:/Users/Yingj/TmrlData/config/config.json"),
-        episodes=1000,
+        episodes=4000,
         alpha=0.10,
         gamma=0.99,
         seed=0,

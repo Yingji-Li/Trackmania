@@ -31,28 +31,25 @@ def log_scale_distance(d: float, max_d: float = 100.0) -> float:
 
 
 def extract_features(obs) -> np.ndarray:
+    # speed -> scalar in [0, 1]
     speed = float(np.array(obs[0]).reshape(-1)[0])
     speed = np.clip(speed, 0.0, 300.0) / 300.0
 
-    lidar_hist = np.array(obs[1])        # (4, 19)
-    lidar = lidar_hist.mean(axis=0)      # (19,)
+    # lidar history -> (4, 19)
+    lidar_hist = np.array(obs[1], dtype=np.float32)
 
     MAX_LIDAR = 100.0
-    lidar = np.where(lidar == 0.0, MAX_LIDAR, lidar)
+    # 0.0 usually means "no hit": treat as far away
+    lidar_hist = np.where(lidar_hist == 0.0, MAX_LIDAR, lidar_hist)
 
-    def sector_min(arr: np.ndarray) -> float:
-        arr = np.where(arr == 0.0, MAX_LIDAR, arr)
-        return float(np.min(arr))
+    # clip + normalize to [0, 1]
+    lidar_hist = np.clip(lidar_hist, 0.0, MAX_LIDAR) / MAX_LIDAR
 
-    left_raw   = sector_min(lidar[:6])
-    center_raw = sector_min(lidar[6:13])
-    right_raw  = sector_min(lidar[13:])
+    # flatten (4, 19) -> (76,)
+    lidar_flat = lidar_hist.reshape(-1)
 
-    left   = log_scale_distance(left_raw, MAX_LIDAR)
-    center = log_scale_distance(center_raw, MAX_LIDAR)
-    right  = log_scale_distance(right_raw, MAX_LIDAR)
-
-    return np.array([speed, left, center, right], dtype=np.float32)
+    # final state: (77,) = [speed] + 76 lidar values
+    return np.concatenate(([speed], lidar_flat)).astype(np.float32)
 
 
 # -----------------------------
@@ -70,13 +67,8 @@ def build_action_set():
 # -----------------------------
 # Epsilon schedule (fixed)
 # -----------------------------
-def epsilon_by_episode(ep, eps_start=1.0, eps_end=0.05, eps_decay=1500):
-    # Keep full exploration early, then decay.
-    if ep < 500:
-        return 1.0
-    ep2 = ep - 500
-    return eps_end + (eps_start - eps_end) * math.exp(-ep2 / eps_decay)
-
+def epsilon_by_step(step, eps_start=1.0, eps_end=0.05, decay_steps=200_000):
+    return eps_end + (eps_start - eps_end) * math.exp(-step / decay_steps)
 
 # -----------------------------
 # Replay buffer
@@ -160,7 +152,7 @@ def plot_progress(ep_returns, moving_avg, out_path: str):
 # -----------------------------
 def train_sync(
     config_path: str = "config.json",
-    episodes: int = 4000,
+    episodes: int = 6000,
     gamma: float = 0.99,
     seed: int = 0,
     save_every: int = 50,
@@ -186,7 +178,7 @@ def train_sync(
 
     actions = build_action_set()
     n_actions = len(actions)
-    state_dim = 4
+    state_dim = 77
 
     env = get_environment()
 
@@ -211,14 +203,12 @@ def train_sync(
         for ep in range(1, episodes + 1):
             obs, info = env.reset()
             state = extract_features(obs)
-
-            eps = float(epsilon_by_episode(ep))
             total_rew = 0.0
 
             for t in range(ep_max_len):
+                eps = float(epsilon_by_step(global_step))
                 a_idx = select_action_dqn(q_net, state, n_actions, eps, rng, device)
                 act = actions[a_idx]
-
                 obs2, rew, terminated, truncated, info = env.step(act)
                 rew = float(rew)
                 done = bool(terminated or truncated)
@@ -313,7 +303,7 @@ def train_sync(
 if __name__ == "__main__":
     train_sync(
         config_path=str(Path("C:/Users/Yingj/TmrlData/config/config.json")),
-        episodes=4000,
+        episodes=6000,
         gamma=0.99,
         seed=0,
         save_every=50,

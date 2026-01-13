@@ -1,11 +1,8 @@
 import json
 import math
 import os
-import time
 from collections import deque
 from pathlib import Path
-import multiprocessing as mp
-from queue import Empty, Full
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from tmrl import get_environment
+from tmrl import get_environment  # TMRL Gymnasium env for TrackMania 2020
 
 
 # -----------------------------
@@ -28,52 +25,33 @@ def load_config(path: str) -> dict:
 # -----------------------------
 # Observation -> small continuous state (features)
 # -----------------------------
-def log_scale_distance(d: float, max_d: float = 100.0) -> float:
-    d = float(np.clip(d, 0.0, max_d))
-    return float(np.log1p(d) / np.log1p(max_d))
-
-
 def extract_features(obs) -> np.ndarray:
-    """
-    Normalised continuous feature vector for DQN:
-      [speed, lidar_left, lidar_center, lidar_right] ∈ [0, 1]
-    """
+    # speed -> scalar in [0, 1]
     speed = float(np.array(obs[0]).reshape(-1)[0])
     speed = np.clip(speed, 0.0, 300.0) / 300.0
 
-    lidar_hist = np.array(obs[1])        # (4, 19)
-    lidar = lidar_hist.mean(axis=0)      # (19,)
+    # lidar history -> (4, 19)
+    lidar_hist = np.array(obs[1], dtype=np.float32)
 
     MAX_LIDAR = 100.0
-    lidar = np.where(lidar == 0.0, MAX_LIDAR, lidar)
+    # 0.0 usually means "no hit": treat as far away
+    lidar_hist = np.where(lidar_hist == 0.0, MAX_LIDAR, lidar_hist)
 
-    def sector_min(arr: np.ndarray) -> float:
-        arr = np.where(arr == 0.0, MAX_LIDAR, arr)
-        return float(np.min(arr))
+    # clip + normalize to [0, 1]
+    lidar_hist = np.clip(lidar_hist, 0.0, MAX_LIDAR) / MAX_LIDAR
 
-    left_raw   = sector_min(lidar[:6])
-    center_raw = sector_min(lidar[6:13])
-    right_raw  = sector_min(lidar[13:])
+    # flatten (4, 19) -> (76,)
+    lidar_flat = lidar_hist.reshape(-1)
 
-    left   = log_scale_distance(left_raw, MAX_LIDAR)
-    center = log_scale_distance(center_raw, MAX_LIDAR)
-    right  = log_scale_distance(right_raw, MAX_LIDAR)
-
-    return np.array([speed, left, center, right], dtype=np.float32)
+    # final state: (77,) = [speed] + 76 lidar values
+    return np.concatenate(([speed], lidar_flat)).astype(np.float32)
 
 
 # -----------------------------
 # Discrete action set for TrackMania (expanded)
 # -----------------------------
 def build_action_set():
-    """
-    Action format: [gas, brake, steer]
-    Adds:
-      - coast + steer (0,0,steer)
-      - brake + steer (0,1,steer)
-    """
-    # FIXED typo from your code: you had "-0.5 -0.25" which becomes -0.75.
-    steers = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+    steers = [-1.0, -0.5, 0.0, 0.5, 1.0]
     actions = []
     actions += [np.array([1.0, 0.0, s], dtype=np.float32) for s in steers]  # gas + steer
     actions += [np.array([0.0, 0.0, s], dtype=np.float32) for s in steers]  # coast + steer
@@ -82,10 +60,11 @@ def build_action_set():
 
 
 # -----------------------------
-# Epsilon schedule
+# Epsilon schedule (fixed)
 # -----------------------------
-def epsilon_by_episode(ep, eps_start=1.0, eps_end=0.05, eps_decay=3000):
-    return eps_end + (eps_start - eps_end) * math.exp(-ep / eps_decay)
+def epsilon_by_step(step, eps_start=1.0, eps_end=0.05, decay_steps=150000):
+    # Exponential decay
+    return eps_end + (eps_start - eps_end) * math.exp(-step / decay_steps)
 
 
 # -----------------------------
@@ -140,14 +119,25 @@ class DQN(nn.Module):
 
 
 @torch.no_grad()
-def select_action_dqn(q_net: nn.Module, state: np.ndarray, n_actions: int, epsilon: float,
-                      rng: np.random.Generator, device: torch.device) -> int:
-    if rng.random() < epsilon:
-        return int(rng.integers(n_actions))
-    s = torch.from_numpy(state).to(device=device, dtype=torch.float32).unsqueeze(0)
-    q = q_net(s)
-    return int(torch.argmax(q, dim=1).item())
+def select_action_epsilon_greedy(
+    q_net: nn.Module,
+    state: np.ndarray,
+    epsilon: float,
+    rng: np.random.Generator,
+    device: torch.device,
+) -> int:
+    # Explore
+    if rng.random() < float(epsilon):
+        # Use numpy RNG for consistency with your code
+        # (Assumes q_net output size == n_actions)
+        s = torch.from_numpy(state).to(device=device, dtype=torch.float32).unsqueeze(0)
+        n_actions = int(q_net(s).shape[1])
+        return int(rng.integers(0, n_actions))
 
+    # Exploit (greedy)
+    s = torch.from_numpy(state).to(device=device, dtype=torch.float32).unsqueeze(0)
+    q = q_net(s).squeeze(0)
+    return int(torch.argmax(q).item())
 
 # -----------------------------
 # Plotting
@@ -158,7 +148,7 @@ def plot_progress(ep_returns, moving_avg, out_path: str):
     plt.plot(moving_avg, label="Moving average")
     plt.xlabel("Episode")
     plt.ylabel("Return")
-    plt.title("DDQN progress (async actor-learner)")
+    plt.title("DDQN")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
@@ -166,124 +156,39 @@ def plot_progress(ep_returns, moving_avg, out_path: str):
 
 
 # -----------------------------
-# Actor process
+# Synchronous learner (no actor)
 # -----------------------------
-def actor_loop(
-    config_path: str,
-    traj_queue: mp.Queue,
-    stats_queue: mp.Queue,
-    weights_queue: mp.Queue,
-    stop_event: mp.Event,
-    seed: int,
-    epsilon_value: mp.Value,
-):
-    """
-    Runs TrackMania env and streams transitions to traj_queue.
-    Receives latest q_net weights from weights_queue (non-blocking).
-    """
-    cfg = load_config(config_path)
-    ep_max_len = int(cfg["ENV"]["RTGYM_CONFIG"]["ep_max_length"])
-
-    env = get_environment()
-
-    rng = np.random.default_rng(seed)
-    actions = build_action_set()
-    n_actions = len(actions)
-    state_dim = 4
-
-    # Actor does inference on CPU to avoid fighting learner's GPU
-    device = torch.device("cpu")
-    q_net = DQN(state_dim, n_actions).to(device)
-    q_net.eval()
-
-    # Wait for initial weights
-    init = weights_queue.get()
-    q_net.load_state_dict(init)
-
-    episode = 0
-    while not stop_event.is_set():
-        episode += 1
-        obs, info = env.reset()
-        state = extract_features(obs)
-        total_rew = 0.0
-
-        for t in range(ep_max_len):
-            # Pull latest weights if available (don’t block)
-            try:
-                while True:
-                    w = weights_queue.get_nowait()
-                    q_net.load_state_dict(w)
-            except Empty:
-                pass
-
-            eps = float(epsilon_value.value)
-            a_idx = select_action_dqn(q_net, state, n_actions, eps, rng, device)
-            act = actions[a_idx]
-
-            obs2, rew, terminated, truncated, info = env.step(act)
-            rew = float(rew)
-            done = bool(terminated or truncated)
-            state2 = extract_features(obs2)
-
-            # If queue is full, drop rather than blocking the env (keeps actor real-time)
-            try:
-                traj_queue.put_nowait((state, a_idx, rew, state2, done))
-            except Full:
-                pass
-
-            total_rew += rew
-            state = state2
-
-            if done or stop_event.is_set():
-                break
-
-        # Send episode stats (non-blocking)
-        try:
-            stats_queue.put_nowait((episode, total_rew))
-        except Full:
-            pass
-
-    try:
-        env.close()
-    except Exception:
-        pass
-
-
-# -----------------------------
-# Async Learner (main)
-# -----------------------------
-def train_async(
+def train_sync(
     config_path: str = "config.json",
-    episodes: int = 5000,
+    episodes: int = 6000,
     gamma: float = 0.99,
     seed: int = 0,
     save_every: int = 50,
-    out_dir: str = "ddqn_out_async",
+    out_dir: str = "ddqn_out",
     # DQN hyperparams
-    lr: float = 1e-3,
+    lr: float = 1e-4,
     buffer_size: int = 100_000,
     batch_size: int = 64,
-    learning_starts: int = 2_000,
+    learning_starts: int = 2_000,   # in env steps
     train_every: int = 4,
-    target_update_every: int = 2_000,  # in learner steps (transitions consumed)
-    max_grad_norm: float = 10.0,
-    # async knobs
-    broadcast_every_sec: float = 1.0,   # how often learner pushes fresh weights to actor
+    target_update_every: int = 1_000,  # in learner/env steps
+    max_grad_norm: float = 1.0,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
-    # Spawn-safe
-    mp.set_start_method("spawn", force=True)
+    cfg = load_config(config_path)
+    ep_max_len = int(cfg["ENV"]["RTGYM_CONFIG"]["ep_max_length"])
 
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
-    # Learner device (GPU if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     actions = build_action_set()
     n_actions = len(actions)
-    state_dim = 4
+    state_dim = 77
+
+    env = get_environment()
 
     q_net = DQN(state_dim, n_actions).to(device)
     target_net = DQN(state_dim, n_actions).to(device)
@@ -292,138 +197,99 @@ def train_async(
 
     optimizer = optim.Adam(q_net.parameters(), lr=lr)
     loss_fn = nn.SmoothL1Loss()
+
     replay = ReplayBuffer(buffer_size, state_dim)
 
-    # Queues/events for actor
-    traj_queue = mp.Queue(maxsize=50_000)
-    stats_queue = mp.Queue(maxsize=1_000)
-    weights_queue = mp.Queue(maxsize=4)
-    stop_event = mp.Event()
-    epsilon_value = mp.Value("d", 1.0)  # shared epsilon
-
-    # Start actor
-    actor = mp.Process(
-        target=actor_loop,
-        args=(str(config_path), traj_queue, stats_queue, weights_queue, stop_event, seed, epsilon_value),
-        daemon=True,
-    )
-    actor.start()
-
-    # Broadcast initial weights
-    with torch.no_grad():
-        sd0 = {k: v.detach().cpu() for k, v in q_net.state_dict().items()}
-    weights_queue.put(sd0)
-
-    # Logging
     ep_returns = []
     moving_avg = []
     ma_window = 20
     recent = deque(maxlen=ma_window)
 
-    # We count “learner steps” as transitions consumed (like your global_step)
     global_step = 0
-    last_broadcast = time.time()
-
-    # Episode counter based on actor stats (not perfect, but matches your eps schedule intent)
-    last_seen_episode = 0
 
     try:
-        while last_seen_episode < episodes:
-            # Read actor episode stats if any
-            try:
-                while True:
-                    ep_id, ep_ret = stats_queue.get_nowait()
-                    last_seen_episode = max(last_seen_episode, int(ep_id))
+        for ep in range(1, episodes + 1):
+            obs, info = env.reset()
+            state = extract_features(obs)
+            total_rew = 0.0
+            eps = float(epsilon_by_step(global_step))
 
-                    ep_returns.append(float(ep_ret))
-                    recent.append(float(ep_ret))
-                    moving_avg.append(float(np.mean(recent)))
+            for t in range(ep_max_len):
+                eps = float(epsilon_by_step(global_step))
+                a_idx = select_action_epsilon_greedy(q_net, state, eps, rng, device)
+                act = actions[a_idx]
 
-                    # Update epsilon schedule (your original epsilon_by_episode)
-                    epsilon_value.value = float(epsilon_by_episode(last_seen_episode))
+                obs2, rew, terminated, truncated, info = env.step(act)
+                rew = float(rew)
+                done = bool(terminated or truncated)
 
-                    if ep_id % 10 == 0:
-                        print(
-                            f"Episode {ep_id:4d}/{episodes} | return={ep_ret:8.2f} | "
-                            f"ma({ma_window})={moving_avg[-1]:8.2f} | eps={epsilon_value.value:5.3f} | steps={global_step}"
-                        )
+                state2 = extract_features(obs2)
+                replay.push(state, a_idx, rew, state2, done)
 
-                    # Save checkpoints (based on actor episode count)
-                    if save_every > 0 and ep_id % save_every == 0:
-                        ckpt = {
-                            "episode": int(ep_id),
-                            "global_step": int(global_step),
-                            "q_net": q_net.state_dict(),
-                            "target_net": target_net.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "seed": seed,
-                            "gamma": gamma,
-                            "lr": lr,
-                            "n_actions": n_actions,
-                            "state_dim": state_dim,
-                        }
-                        torch.save(ckpt, os.path.join(out_dir, f"ddqn_ep{ep_id}.pt"))
-                        plot_progress(ep_returns, moving_avg, out_path=os.path.join(out_dir, f"progress_ep{ep_id}.png"))
-            except Empty:
-                pass
+                total_rew += rew
+                state = state2
+                global_step += 1
 
-            # Consume one transition (block briefly so we don’t spin)
-            try:
-                s, a, r, s2, d = traj_queue.get(timeout=0.05)
-            except Empty:
-                continue
+                # Learn
+                if len(replay) >= learning_starts and (global_step % train_every == 0):
+                    s_b, a_b, r_b, s2_b, d_b = replay.sample(batch_size, rng)
 
-            replay.push(s, a, r, s2, d)
-            global_step += 1
+                    s_t  = torch.from_numpy(s_b).to(device=device, dtype=torch.float32)
+                    a_t  = torch.from_numpy(a_b).to(device=device, dtype=torch.int64).unsqueeze(1)
+                    r_t  = torch.from_numpy(r_b).to(device=device, dtype=torch.float32).unsqueeze(1)
+                    s2_t = torch.from_numpy(s2_b).to(device=device, dtype=torch.float32)
+                    d_t  = torch.from_numpy(d_b).to(device=device, dtype=torch.float32).unsqueeze(1)
 
-            # Learn (same as your loop)
-            if len(replay) >= learning_starts and (global_step % train_every == 0):
-                s_b, a_b, r_b, s2_b, d_b = replay.sample(batch_size, rng)
+                    q_sa = q_net(s_t).gather(1, a_t)
 
-                s_t  = torch.from_numpy(s_b).to(device=device, dtype=torch.float32)
-                a_t  = torch.from_numpy(a_b).to(device=device, dtype=torch.int64).unsqueeze(1)
-                r_t  = torch.from_numpy(r_b).to(device=device, dtype=torch.float32).unsqueeze(1)
-                s2_t = torch.from_numpy(s2_b).to(device=device, dtype=torch.float32)
-                d_t  = torch.from_numpy(d_b).to(device=device, dtype=torch.float32).unsqueeze(1)
+                    with torch.no_grad():
+                        next_actions = q_net(s2_t).argmax(dim=1, keepdim=True)
+                        next_q = target_net(s2_t).gather(1, next_actions)
+                        target = r_t + (1.0 - d_t) * gamma * next_q
 
-                q_sa = q_net(s_t).gather(1, a_t)
+                    loss = loss_fn(q_sa, target)
 
-                with torch.no_grad():
-                    next_a = q_net(s2_t).argmax(dim=1, keepdim=True)
-                    next_q = target_net(s2_t).gather(1, next_a)
-                    target = r_t + (1.0 - d_t) * gamma * next_q
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(q_net.parameters(), max_grad_norm)
+                    optimizer.step()
 
-                loss = loss_fn(q_sa, target)
+                # Target net update
+                if global_step % target_update_every == 0:
+                    target_net.load_state_dict(q_net.state_dict())
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(q_net.parameters(), max_grad_norm)
-                optimizer.step()
+                if done:
+                    break
 
-            # Update target network (same cadence idea as yours)
-            if global_step % target_update_every == 0:
-                target_net.load_state_dict(q_net.state_dict())
+            ep_returns.append(float(total_rew))
+            recent.append(float(total_rew))
+            moving_avg.append(float(np.mean(recent)))
 
-            # Broadcast latest weights periodically (time-based keeps it simple)
-            if time.time() - last_broadcast >= broadcast_every_sec:
-                with torch.no_grad():
-                    sd = {k: v.detach().cpu() for k, v in q_net.state_dict().items()}
-                # Don’t block if actor hasn’t consumed old weights yet: drop old and push new
-                try:
-                    while True:
-                        _ = weights_queue.get_nowait()
-                except Empty:
-                    pass
-                try:
-                    weights_queue.put_nowait(sd)
-                except Full:
-                    pass
-                last_broadcast = time.time()
+            if ep % 10 == 0:
+                print(
+                    f"Episode {ep:4d}/{episodes} | return={total_rew:8.2f} | "
+                    f"ma({ma_window})={moving_avg[-1]:8.2f} | eps={eps:5.3f} | steps={global_step}"
+                )
 
-        # Final save
+            if save_every > 0 and ep % save_every == 0:
+                ckpt = {
+                    "episode": ep,
+                    "global_step": global_step,
+                    "q_net": q_net.state_dict(),
+                    "target_net": target_net.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "seed": seed,
+                    "gamma": gamma,
+                    "lr": lr,
+                    "n_actions": n_actions,
+                    "state_dim": state_dim,
+                }
+                torch.save(ckpt, os.path.join(out_dir, f"dqn_ep{ep}.pt"))
+                plot_progress(ep_returns, moving_avg, out_path=os.path.join(out_dir, f"progress_ep{ep}.png"))
+
         ckpt = {
-            "episode": int(last_seen_episode),
-            "global_step": int(global_step),
+            "episode": episodes,
+            "global_step": global_step,
             "q_net": q_net.state_dict(),
             "target_net": target_net.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -433,31 +299,31 @@ def train_async(
             "n_actions": n_actions,
             "state_dim": state_dim,
         }
-        torch.save(ckpt, os.path.join(out_dir, "ddqn_final.pt"))
+        torch.save(ckpt, os.path.join(out_dir, "dqn_final.pt"))
         plot_progress(ep_returns, moving_avg, out_path=os.path.join(out_dir, "progress_final.png"))
 
     finally:
-        stop_event.set()
-        if actor.is_alive():
-            actor.join(timeout=2)
+        try:
+            env.close()
+        except Exception:
+            pass
 
     return ep_returns, moving_avg
 
 
 if __name__ == "__main__":
-    train_async(
-        config_path=Path("C:/Users/Yingj/TmrlData/config/config.json"),
-        episodes=5000,
+    train_sync(
+        config_path=str(Path("C:/Users/Yingj/TmrlData/config/config.json")),
+        episodes=6000,
         gamma=0.99,
         seed=0,
         save_every=50,
-        out_dir="ddqn_out_async",
-        lr=1e-3,
+        out_dir="ddqn_out",
+        lr=1e-4,
         buffer_size=100_000,
         batch_size=64,
-        learning_starts=2_000,
+        learning_starts=2000,
         train_every=4,
-        target_update_every=2_000,
-        max_grad_norm=10.0,
-        broadcast_every_sec=1.0,
+        target_update_every=1000,
+        max_grad_norm=1.0,
     )
